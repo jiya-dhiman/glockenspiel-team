@@ -1,0 +1,25 @@
+{
+  "_comment": "Example for a later full build: 17 natural bars G5-B7 on 17 free BCM GPIOs of a Pi 3. Edit notes/pins to match the real instrument and wiring. A per-note pulse can be set like {\"pin\": 4, \"pulse_ms\": 25}.",
+  "pulse_ms": 20,
+  "min_gap_ms": 60,
+  "max_simultaneous": 4,
+  "notes": {
+    "G5": 4,
+    "A5": 17,
+    "B5": 27,
+    "C6": 22,
+    "D6": 5,
+    "E6": 6,
+    "F6": 13,
+    "G6": 19,
+    "A6": 26,
+    "B6": 18,
+    "C7": 23,
+    "D7": 24,
+    "E7": 25,
+    "F7": 12,
+    "G7": 16,
+    "A7": 20,
+    "B7": 21
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "_comment": "Which note each solenoid strikes. Current hardware: one solenoid on GPIO17 (placeholder) - set the note to the bar it actually sits over.",
+  "pulse_ms": 20,
+  "min_gap_ms": 60,
+  "max_simultaneous": 4,
+  "notes": {
+    "C6": 17
+  }
+}
