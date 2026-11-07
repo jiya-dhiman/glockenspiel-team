@@ -7,3 +7,6 @@ __pycache__/
 # local Python environment
 .venv/
 venv/
+
+# conductor repo, if cloned inside this folder (better: next to it)
+mini-robotic-concert/
