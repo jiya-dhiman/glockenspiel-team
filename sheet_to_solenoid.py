@@ -301,7 +301,8 @@ def load_musicxml(path, part_selector=None, tempo_override=None):
         if not all_tempos:
             warnings.append(f"no tempo marking found; using {DEFAULT_BPM} BPM (override with --tempo)")
         to_sec = _beats_to_seconds(all_tempos, DEFAULT_BPM)
-    notes = [(to_sec(b), m) for b, m in beat_notes]
+    # keep the beat position (in quarter notes) too: conducted_play.py follows a live conductor in beats
+    notes = [(to_sec(b), m, float(b)) for b, m in beat_notes]
     return notes, [items[i][1] for i in chosen], sorted(set(warnings))
 
 
@@ -350,7 +351,7 @@ def load_midi(path, track_selector=None, tempo_override=None):
         elif msg.type == "note_on" and msg.velocity > 0 and use_notes:
             if getattr(msg, "channel", None) == 9:
                 continue                                # GM drum channel: not pitches
-            notes.append((t, msg.note))
+            notes.append((t, msg.note, tick / mid.ticks_per_beat))
     return notes, [items[i][1] for i in chosen], []
 
 
@@ -372,7 +373,8 @@ def load_score(path, part=None, tempo=None):
 def build_events(notes, pin_map, transpose=0, fold=False):
     mapped = pin_map["notes"]
     events, skipped, folded = [], Counter(), Counter()
-    for t, m in notes:
+    for t, m, *rest in notes:
+        beat = rest[0] if rest else None             # position in quarter notes (None if unknown)
         m += transpose
         if m not in mapped and fold:
             options = [m + 12 * k for k in range(-8, 9) if m + 12 * k in mapped]
@@ -384,7 +386,8 @@ def build_events(notes, pin_map, transpose=0, fold=False):
             skipped[midi_to_name(m)] += 1
             continue
         pin, pulse = mapped[m]
-        events.append((round(t, 4), midi_to_name(m), pin, pulse))
+        events.append((round(t, 4), midi_to_name(m), pin, pulse,
+                       None if beat is None else round(beat, 4)))
     events = sorted(set(events), key=lambda e: (e[0], e[2]))   # same note twice at once -> once
     # dedupe same pin at same instant (can happen after folding)
     seen, unique = set(), []
@@ -393,8 +396,9 @@ def build_events(notes, pin_map, transpose=0, fold=False):
             seen.add((e[0], e[2]))
             unique.append(e)
     if unique:
-        t0 = unique[0][0]                                 # trim leading silence
-        unique = [(round(t - t0, 4), n, p, w) for t, n, p, w in unique]
+        t0, b0 = unique[0][0], unique[0][4]               # trim leading silence
+        unique = [(round(t - t0, 4), n, p, w, None if b is None or b0 is None else round(b - b0, 4))
+                  for t, n, p, w, b in unique]
     return unique, skipped, folded
 
 
@@ -403,7 +407,7 @@ def check_events(events, pin_map):
     gap = pin_map["min_gap_ms"] / 1000.0
     last = {}
     fast = Counter()
-    for t, note, pin, _ in events:
+    for t, note, pin, *_ in events:
         if pin in last and t - last[pin] < gap:
             fast[note] += 1
         last[pin] = t
@@ -428,7 +432,8 @@ def cmd_convert(a):
         "parts": parts,
         "transpose": a.transpose,
         "duration_s": events[-1][0] if events else 0,
-        "events": [{"t": t, "note": n, "pin": p, "pulse_ms": w} for t, n, p, w in events],
+        "events": [dict({"t": t, "note": n, "pin": p, "pulse_ms": w}, **({} if b is None else {"beat": b}))
+                   for t, n, p, w, b in events],
         "skipped_notes": dict(skipped),
     }
     with open(a.output, "w") as f:
