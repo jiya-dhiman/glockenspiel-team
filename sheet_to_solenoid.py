@@ -541,18 +541,100 @@ def _wait_until(target):
         time.sleep(remaining - 0.002 if remaining > 0.003 else 0)
 
 
+class TempoPlayer:
+    """Beat-clock scheduler: decides WHEN to strike, and lets the tempo change while playing.
+
+    The song is a list of (beat, item) sorted by beat. A beat clock advances at the current
+    BPM, so changing the tempo stretches or shrinks every remaining gap automatically.
+
+      strike  function(item) called for each note when its beat arrives
+      lead_s  fire this many seconds early (to compensate for mechanical delay)
+      ramp    None = jump to a new tempo instantly; 0.5 = move halfway to it each beat
+    """
+
+    def __init__(self, song, bpm, strike, lead_s=0.0, ramp=None):
+        self.song = song
+        self.bpm = bpm              # tempo actually being played
+        self.target = bpm           # tempo asked for (keys / conductor)
+        self.strike = strike
+        self.lead_s = lead_s
+        self.ramp = ramp
+        self.beat = 0.0
+        self.last_t = None
+        self.i = 0
+
+    def set_tempo(self, bpm):
+        if bpm:
+            self.target = bpm
+            if self.ramp is None:
+                self.bpm = bpm
+
+    def update(self, now):
+        """Call every ~1 ms. Fires every note whose beat has been reached.
+        Returns False once the last note has been fired."""
+        if self.last_t is not None:
+            passed = (now - self.last_t) * self.bpm / 60
+            self.beat += passed
+            if self.ramp is not None:
+                self.bpm += (self.target - self.bpm) * min(1.0, self.ramp * passed)
+        self.last_t = now
+        lead_beats = self.lead_s * self.bpm / 60
+        while self.i < len(self.song) and self.beat + lead_beats >= self.song[self.i][0]:
+            self.strike(self.song[self.i][1])
+            self.i += 1
+        return self.i < len(self.song)
+
+
+class KeyReader:
+    """Non-blocking single-key reads, so tempo can be changed while the song plays.
+    Does nothing (poll() always returns None) if stdin isn't a terminal."""
+
+    def __init__(self):
+        self.enabled = sys.stdin.isatty()
+        self._win = False
+        self._old = None
+
+    def __enter__(self):
+        if not self.enabled:
+            return self
+        try:
+            import msvcrt                          # Windows
+            self._win = True
+        except ImportError:
+            import termios, tty                    # Linux / Mac / Raspberry Pi
+            self._fd = sys.stdin.fileno()
+            self._old = termios.tcgetattr(self._fd)
+            tty.setcbreak(self._fd)                # unlike raw mode, Ctrl+C still works
+        return self
+
+    def __exit__(self, *exc):
+        if self._old is not None:
+            import termios
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
+
+    def poll(self):
+        if not self.enabled:
+            return None
+        if self._win:
+            import msvcrt
+            return msvcrt.getwch() if msvcrt.kbhit() else None
+        import os, select
+        if select.select([self._fd], [], [], 0)[0]:
+            # read the raw fd: sys.stdin.read() buffers extra keys where select() can't see them
+            return os.read(self._fd, 1).decode(errors="ignore")
+        return None
+
+
+REF_BPM = 60.0          # song.json times are in seconds, i.e. beats at 60 BPM. speed 1.0 = 60 BPM.
+SPEED_STEP = 0.05       # each + / - keypress changes the speed by 5%
+MIN_SPEED, MAX_SPEED = 0.1, 4.0
+
+
 def cmd_play(a):
     song = load_song(a.song)
     events = song["events"]
     if not events:
         sys.exit("nothing to play")
-
-    actions = []                    # (time, 0=off/1=on, pin, label)
-    for e in events:
-        t = e["t"] / a.speed
-        actions.append((t, 1, e["pin"], e["note"], e["pulse_ms"]))
-        actions.append((t + e["pulse_ms"] / 1000.0, 0, e["pin"], e["note"], e["pulse_ms"]))
-    actions.sort(key=lambda x: (x[0], x[1]))   # at the same instant, release before striking
 
     pins = sorted({e["pin"] for e in events})
     if a.mock:
@@ -569,19 +651,56 @@ def cmd_play(a):
                      "To test here, add --mock:\n"
                      f"  python sheet_to_solenoid.py play {a.song} --mock")
 
-    print(f"Playing {len(events)} strikes on GPIO {', '.join(map(str, pins))}"
-          f"{' (mock)' if a.mock else ''}. Ctrl+C to stop.")
-    start = time.perf_counter() + 1.0
-    try:
-        for t, kind, pin, note, pulse in actions:
-            if not a.fast:
-                _wait_until(start + t)
-            if kind:
-                devices[pin].on()
-                if a.mock:
-                    print(f"{t:8.3f}s  STRIKE {note:<4} GPIO{pin:<3} {pulse} ms")
-            else:
+    # --fast: run on a virtual clock instead of real time (mock only)
+    vclock = [0.0]
+    clock = (lambda: vclock[0]) if a.fast else time.perf_counter
+
+    off_at = {}                         # pin -> wall-clock time to release it
+
+    def strike(e):
+        pin = e["pin"]
+        devices[pin].on()
+        off_at[pin] = clock() + e["pulse_ms"] / 1000.0     # pulse length is real time,
+        if a.mock:                                          # so it does NOT scale with tempo
+            # song = position in the score (fixed); real = actual seconds since start (tempo-dependent)
+            print(f"real {clock() - t_start:6.2f}s  song {player.beat:6.2f}s  "
+                  f"x{player.bpm / REF_BPM:.2f}  STRIKE {e['note']:<4} GPIO{pin:<3} {e['pulse_ms']} ms")
+
+    def release_due(now):
+        for pin, t in list(off_at.items()):
+            if now >= t:
                 devices[pin].off()
+                del off_at[pin]
+
+    score = [(e["t"], e) for e in events]
+    player = TempoPlayer(score, bpm=REF_BPM * a.speed, strike=strike, ramp=a.ramp)
+    player.beat = -1.0                  # short lead-in before the first note
+    t_start = clock()                   # for the "real" time shown in mock mode
+
+    print(f"Playing {len(events)} strikes on GPIO {', '.join(map(str, pins))}"
+          f"{' (mock)' if a.mock else ''}.  + / - = speed   q = quit   Ctrl+C = stop")
+    try:
+        with KeyReader() as keys:
+            while True:
+                now = clock()
+                playing = player.update(now)
+                release_due(now)
+                if not playing and not off_at:
+                    break
+                key = keys.poll()
+                if key in ("q", "Q"):
+                    break
+                if key in ("+", "=", "-", "_"):
+                    speed = player.target / REF_BPM
+                    speed += SPEED_STEP if key in "+=" else -SPEED_STEP
+                    speed = max(MIN_SPEED, min(MAX_SPEED, speed))
+                    player.set_tempo(REF_BPM * speed)
+                    print(f"'{key}' pressed ({'faster' if key in '+=' else 'slower'}): "
+                            f"speed x{speed:.2f}\r")
+                if a.fast:
+                    vclock[0] += 0.001
+                else:
+                    time.sleep(0.001)
     except KeyboardInterrupt:
         print("\nstopped")
     finally:
@@ -622,7 +741,10 @@ def main():
     p.add_argument("song")
     p.add_argument("--mock", action="store_true", help="print instead of using GPIO (no Pi needed)")
     p.add_argument("--fast", action="store_true", help="with --mock: don't wait in real time")
-    p.add_argument("--speed", type=float, default=1.0, help="0.5 = half speed")
+    p.add_argument("--speed", type=float, default=1.0,
+                   help="starting speed, 0.5 = half speed (change it live with + / -)")
+    p.add_argument("--ramp", type=float, default=None,
+                   help="ease into tempo changes instead of jumping, e.g. 0.5 (default: jump)")
     p.set_defaults(func=cmd_play)
 
     a = ap.parse_args()
